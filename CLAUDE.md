@@ -5,9 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-# Setup
+# Setup — requires Python 3.13 (3.14 is incompatible with pydantic-core)
 cp .env.example .env        # fill in credentials
-python -m venv .venv
+python3.13 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 

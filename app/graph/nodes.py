@@ -1,7 +1,10 @@
+import logging
 from app.fflogs.client import FFLogsClient
 from app.analysis.buffs import ALL_RAID_BUFF_IDS
 from app.graph.state import GraphState
 from langchain_openai import ChatOpenAI
+
+log = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
     "You are a FFXIV raid log analyst. "
@@ -18,28 +21,36 @@ SYSTEM_PROMPT = (
 async def fetch_data(state: GraphState) -> GraphState:
     code = state["report_code"]
     fight_id = state["fight_id"]
+    log.info("fetch_data: report=%s fight=%s", code, fight_id)
 
     async with FFLogsClient() as client:
         fights = await client.get_fights(code)
         actors = await client.get_actors(code)
+        log.info("fetch_data: found %d fights, %d actors", len(fights), len(actors))
 
         death_events  = await client.get_events(code, fight_id, "Deaths")
         cast_events   = await client.get_events(code, fight_id, "Casts")
         buff_events   = await client.get_events(code, fight_id, "Buffs")
         damage_events = await client.get_events(code, fight_id, "DamageTaken")
+        log.info(
+            "fetch_data: events fetched — deaths=%d casts=%d buffs=%d damage=%d",
+            len(death_events), len(cast_events), len(buff_events), len(damage_events),
+        )
 
     fight = next((f for f in fights if f["id"] == fight_id), None)
     if fight is None:
         raise ValueError(f"Fight {fight_id} not found in report {code}")
 
     duration_sec = (fight["endTime"] - fight["startTime"]) / 1000
+    outcome = "kill" if fight.get("kill") else "wipe"
+    log.info("fetch_data: fight=%r duration=%.0fs outcome=%s", fight["name"], duration_sec, outcome)
 
+    # Return only the keys this node populates.
     return {
-        **state,
         "fight_meta": {
             "boss": fight["name"],
             "duration_sec": duration_sec,
-            "outcome": "kill" if fight.get("kill") else "wipe",
+            "outcome": outcome,
             "fight_percent": fight.get("fightPercentage"),
         },
         "actors": actors,
@@ -55,8 +66,8 @@ async def fetch_data(state: GraphState) -> GraphState:
 # --------------------------------------------------------------------------- #
 
 async def death_analyst(state: GraphState) -> GraphState:
+    log.info("death_analyst: processing %d death events", len(state.get("death_events", [])))
     actor_map: dict[int, dict] = {a["id"]: a for a in state.get("actors", [])}
-    fight_start = 0  # events use relative timestamps from fight start
 
     deaths = []
     for event in state.get("death_events", []):
@@ -72,7 +83,7 @@ async def death_analyst(state: GraphState) -> GraphState:
         active_buffs: list[str] = []
         active_debuffs: list[str] = []
 
-        # Find the killing hit in damage events (highest overkill near death timestamp).
+        # Find the killing hit: damage event with highest overkill within 2s of the death.
         killing_ability = "Unknown"
         overkill_dmg = 0
         for dmg in state.get("damage_events", []):
@@ -94,8 +105,14 @@ async def death_analyst(state: GraphState) -> GraphState:
             "active_debuffs": active_debuffs,
             "active_buffs": active_buffs,
         })
+        log.info(
+            "death_analyst: %s (%s) died at %.0fs — %s overkill=%d",
+            actor.get("name"), actor.get("subType"), timestamp_sec, killing_ability, overkill_dmg,
+        )
 
-    return {**state, "deaths": deaths}
+    log.info("death_analyst: done, %d player deaths", len(deaths))
+    # Return only the key this node populates.
+    return {"deaths": deaths}
 
 
 # --------------------------------------------------------------------------- #
@@ -103,20 +120,17 @@ async def death_analyst(state: GraphState) -> GraphState:
 # --------------------------------------------------------------------------- #
 
 async def performance_analyst(state: GraphState) -> GraphState:
+    log.info("performance_analyst: processing events")
     actor_map: dict[int, dict] = {a["id"]: a for a in state.get("actors", [])}
-    fight_duration = state["fight_meta"]["duration_sec"]
     flags: list[dict] = []
 
     # --- interrupted casts ---
     interrupt_counts: dict[int, int] = {}
     for event in state.get("cast_events", []):
-        if event.get("type") == "begincast":
-            # If a begincast has no matching cast event within ~5s, it's interrupted.
-            # TODO M3: pair begincast/cast events properly by sourceID + abilityGameID.
-            pass
         if event.get("type") == "interrupt":
             src = event.get("sourceID")
             interrupt_counts[src] = interrupt_counts.get(src, 0) + 1
+        # TODO M3: pair begincast/cast events to detect unconfirmed interrupts.
 
     for actor_id, count in interrupt_counts.items():
         actor = actor_map.get(actor_id, {})
@@ -128,11 +142,11 @@ async def performance_analyst(state: GraphState) -> GraphState:
             "issue": "interrupted_casts",
             "detail": f"{count} interrupted cast(s)",
         })
+        log.info("performance_analyst: %s interrupted %d cast(s)", actor.get("name"), count)
 
     # --- missed raid buff windows ---
-    # Collect time windows when each raid buff was active.
-    buff_windows: list[tuple[float, float]] = []
     active_buffs: dict[tuple[int, int], float] = {}  # (abilityID, targetID) → start_time
+    buff_windows: list[tuple[float, float]] = []
 
     for event in state.get("buff_events", []):
         ability_id = event.get("abilityGameID")
@@ -144,12 +158,13 @@ async def performance_analyst(state: GraphState) -> GraphState:
         elif event["type"] == "removebuff" and key in active_buffs:
             buff_windows.append((active_buffs.pop(key), event["timestamp"] / 1000))
 
-    # TODO M3: compare each player's cast timeline against buff windows to detect misses.
+    log.info("performance_analyst: %d raid buff windows detected", len(buff_windows))
+    # TODO M3: compare player cast timelines against buff windows.
+    # TODO M3: calculate GCD uptime per player.
 
-    # --- low uptime ---
-    # TODO M3: calculate active GCD time per player from cast events vs fight duration.
-
-    return {**state, "performance_flags": flags}
+    log.info("performance_analyst: done, %d flags", len(flags))
+    # Return only the key this node populates.
+    return {"performance_flags": flags}
 
 
 # --------------------------------------------------------------------------- #
@@ -185,13 +200,16 @@ def _build_context(state: GraphState) -> str:
 
 
 async def summariser(state: GraphState, llm: ChatOpenAI) -> GraphState:
+    log.info("summariser: building context and calling LLM")
     context = _build_context(state)
+    log.debug("summariser: context =\n%s", context)
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": f"Here is the fight data:\n\n{context}\n\nSummarise what happened."},
     ]
     response = await llm.ainvoke(messages)
+    log.info("summariser: LLM responded (%d chars)", len(response.content))
 
     analysis = {
         "fight": state["fight_meta"],
@@ -199,8 +217,8 @@ async def summariser(state: GraphState, llm: ChatOpenAI) -> GraphState:
         "performance_flags": state.get("performance_flags", []),
     }
 
+    # Return only the keys this node populates.
     return {
-        **state,
         "context": context,
         "summary": response.content,
         "analysis": analysis,

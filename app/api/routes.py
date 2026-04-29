@@ -1,3 +1,5 @@
+import logging
+import os
 from fastapi import APIRouter, HTTPException
 from app.api.models import (
     AnalyzeRequest, AnalyzeResponse,
@@ -8,8 +10,8 @@ from app.fflogs.client import FFLogsClient
 from app.graph.graph import build_graph
 from app.graph.state import GraphState
 from langchain_openai import ChatOpenAI
-import os
 
+log = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -28,13 +30,16 @@ async def health():
 
 @router.get("/report/{code}", response_model=list[FightSummary])
 async def get_fights(code: str):
+    log.info("GET /report/%s", code)
     async with FFLogsClient() as client:
         fights = await client.get_fights(code)
+    log.info("GET /report/%s → %d fights", code, len(fights))
     return fights
 
 
 @router.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(req: AnalyzeRequest):
+    log.info("POST /analyze report=%s fight=%s", req.report_code, req.fight_id)
     llm = get_llm()
     graph = build_graph(llm)
 
@@ -46,8 +51,10 @@ async def analyze(req: AnalyzeRequest):
     try:
         final_state = await graph.ainvoke(initial_state)
     except Exception as e:
+        log.exception("graph failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
+    log.info("POST /analyze done — %d deaths, %d flags", len(final_state["analysis"]["deaths"]), len(final_state["analysis"]["performance_flags"]))
     return AnalyzeResponse(
         analysis=final_state["analysis"],
         summary=final_state["summary"],
@@ -57,6 +64,7 @@ async def analyze(req: AnalyzeRequest):
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
+    log.info("POST /chat question=%r history_len=%d", req.question[:60], len(req.history))
     llm = get_llm()
 
     system = (

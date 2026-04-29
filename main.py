@@ -1,10 +1,17 @@
 from dotenv import load_dotenv
 load_dotenv()
 
+import logging
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes import router
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
 
 app = FastAPI(title="xivFogPeeker")
 
